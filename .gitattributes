@@ -1,0 +1,8 @@
+# Force LF regardless of platform: these run as shell/Python scripts (often directly from a Windows checkout via
+# WSL), and a CRLF checkout breaks them with "bad interpreter" / syntax errors.
+*.sh text eol=lf
+*.py text eol=lf
+*.rs text eol=lf
+Cargo.lock text eol=lf
+Cargo.toml text eol=lf
+*.patch -text

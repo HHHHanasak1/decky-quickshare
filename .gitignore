@@ -1,0 +1,16 @@
+# Node / frontend build
+node_modules/
+dist/
+
+# Rust build artifacts and vendored (patched) dependency
+daemon/target/
+daemon/vendor/
+Cargo.lock.bak
+
+# Compiled daemon binary and deployment artifacts (build with daemon/build.sh, deploy with deploy.sh)
+bin/
+*.tar
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db

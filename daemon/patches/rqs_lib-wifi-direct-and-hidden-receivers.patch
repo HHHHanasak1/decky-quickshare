@@ -1,0 +1,141 @@
+diff --git a/core_lib/src/hdl/hotspot.rs b/core_lib/src/hdl/hotspot.rs
+index b86631e..d3adb5c 100644
+--- a/core_lib/src/hdl/hotspot.rs
++++ b/core_lib/src/hdl/hotspot.rs
+@@ -10,6 +10,21 @@ use rand::Rng;
+ use tokio::process::Command;
+ 
+ const CON_NAME: &str = "packet-qs-hotspot";
++
++/// qsd: an external hotspot host (the Decky backend brings up a Wi-Fi Direct group on a second interface so wlan0
++/// keeps its network). `up` returns (ssid, password, gateway, frequency); `down` releases one reference.
++pub type HotspotUp = std::sync::Arc<
++    dyn Fn() -> std::pin::Pin<
++            Box<dyn std::future::Future<Output = Result<(String, String, Ipv4Addr, i32), anyhow::Error>> + Send>,
++        > + Send
++        + Sync,
++>;
++pub type HotspotDown = std::sync::Arc<dyn Fn() + Send + Sync>;
++static HOTSPOT_PROVIDER: std::sync::OnceLock<(HotspotUp, HotspotDown)> = std::sync::OnceLock::new();
++
++pub fn set_hotspot_provider(up: HotspotUp, down: HotspotDown) {
++    let _ = HOTSPOT_PROVIDER.set((up, down));
++}
+ /// Fixed listener port on the hotspot, so a firewall rule can be added once:
+ /// `sudo firewall-cmd --zone=nm-shared --add-port=61812/tcp`
+ pub const HOTSPOT_TCP_PORT: u16 = 61812;
+@@ -17,6 +32,7 @@ pub const HOTSPOT_TCP_PORT: u16 = 61812;
+ /// A live hotspot; dropping it tears the network down (and NetworkManager
+ /// then reconnects the interface to its previous network).
+ pub struct HotspotGuard {
++    external: bool,
+     pub ssid: String,
+     pub password: String,
+     pub gateway: Ipv4Addr,
+@@ -36,6 +52,13 @@ impl std::fmt::Debug for HotspotGuard {
+ 
+ impl Drop for HotspotGuard {
+     fn drop(&mut self) {
++        if self.external {
++            if let Some((_, down)) = HOTSPOT_PROVIDER.get() {
++                down();
++            }
++            info!("Hotspot: '{}' released", self.ssid);
++            return;
++        }
+         // Best-effort: `delete` also deactivates an active connection.
+         let _ = std::process::Command::new("nmcli")
+             .args(["connection", "delete", CON_NAME])
+@@ -80,6 +103,10 @@ impl Drop for JoinGuard {
+ /// as a WPA2 AP) and waits for an address. Takes the Wi-Fi interface off its
+ /// current network for the duration; the guard restores it on drop.
+ pub async fn join_wifi(ssid: &str, password: &str) -> Result<JoinGuard, anyhow::Error> {
++    // qsd: never take the Wi-Fi interface off its current network (the user's connection must survive).
++    if std::env::var("QSD_KEEP_WIFI").is_ok() {
++        anyhow::bail!("Wi-Fi switching disabled by QSD_KEEP_WIFI");
++    }
+     let devs = nmcli(&["-t", "-f", "DEVICE,TYPE", "device"]).await?;
+     let ifname = devs
+         .lines()
+@@ -173,6 +200,15 @@ async fn nmcli(args: &[&str]) -> Result<String, anyhow::Error> {
+ /// credentials. Single-channel radios are taken off their current network for
+ /// the duration; NetworkManager reconnects them after teardown.
+ pub async fn start_hotspot() -> Result<HotspotGuard, anyhow::Error> {
++    if let Some((up, _)) = HOTSPOT_PROVIDER.get() {
++        let (ssid, password, gateway, frequency) = up().await?;
++        info!("Hotspot: external '{ssid}' up, gateway {gateway}, freq {frequency} MHz");
++        return Ok(HotspotGuard { external: true, ssid, password, gateway, frequency });
++    }
++    // qsd: never take the Wi-Fi interface off its current network (the user's connection must survive).
++    if std::env::var("QSD_KEEP_WIFI").is_ok() {
++        anyhow::bail!("Wi-Fi switching disabled by QSD_KEEP_WIFI");
++    }
+     let devs = nmcli(&["-t", "-f", "DEVICE,TYPE", "device"]).await?;
+     let ifname = devs
+         .lines()
+@@ -247,6 +283,7 @@ pub async fn start_hotspot() -> Result<HotspotGuard, anyhow::Error> {
+     );
+ 
+     Ok(HotspotGuard {
++        external: false,
+         ssid,
+         password,
+         gateway,
+diff --git a/core_lib/src/hdl/mdns_discovery.rs b/core_lib/src/hdl/mdns_discovery.rs
+index 607a393..37e76dd 100644
+--- a/core_lib/src/hdl/mdns_discovery.rs
++++ b/core_lib/src/hdl/mdns_discovery.rs
+@@ -23,6 +23,10 @@ pub struct EndpointInfo {
+     /// a hint and the marker that this endpoint is reachable over BLE.
+     pub ble_addr: Option<String>,
+     pub ble_psm: Option<u16>,
++    /// qsd: receiver advertises only an encrypted identity (visibility "contacts" / "your devices").
++    /// Listed so the UI can explain it; `name` holds the mDNS host name. Not sendable.
++    #[serde(default)]
++    pub hidden: Option<bool>,
+ }
+ 
+ pub struct MDnsDiscovery {
+@@ -83,7 +87,33 @@ impl MDnsDiscovery {
+                                     // Parse the endpoint info
+                                     let (dt, dn) = match parse_mdns_endpoint_info(n.val_str()) {
+                                         Ok(r) => r,
+-                                        Err(_) => continue
++                                        Err(_) => {
++                                            // qsd: hidden receiver (flags byte bit 4 + 16-byte encrypted metadata key)
++                                            use base64::Engine as _;
++                                            let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
++                                                .decode(n.val_str())
++                                                .unwrap_or_default();
++                                            if raw.len() == 17 && raw[0] & 0x10 != 0 {
++                                                let fullname = info.get_fullname().to_string();
++                                                let host = info.get_hostname().trim_end_matches('.').trim_end_matches(".local").to_string();
++                                                let ei = EndpointInfo {
++                                                    fullname: fullname.clone(),
++                                                    id: format!("{ip}:{port}"),
++                                                    name: Some(host),
++                                                    ip: Some(ip.to_string()),
++                                                    port: Some(port.to_string()),
++                                                    rtype: Some(DeviceType::from_raw_value((raw[0] >> 1) & 0x7)),
++                                                    present: Some(true),
++                                                    ble_addr: None,
++                                                    ble_psm: None,
++                                                    hidden: Some(true),
++                                                };
++                                                info!("ServiceResolved: hidden receiver {:?}", ei);
++                                                cache.insert(fullname, ei.clone());
++                                                let _ = self.sender.send(ei);
++                                            }
++                                            continue;
++                                        }
+                                     };
+ 
+                                     let ip_port = format!("{ip}:{port}");
+@@ -99,6 +129,7 @@ impl MDnsDiscovery {
+                                             present: Some(true),
+                                             ble_addr: None,
+                                             ble_psm: None,
++                                            hidden: None,
+                                         };
+                                         info!("ServiceResolved: Resolved a new service: {:?}", ei);
+                                         cache.insert(fullname.clone(), ei.clone());

@@ -1,0 +1,11 @@
+{
+  "name": "Quick Share",
+  "author": "ppppr",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["quickshare", "share", "nearby-share"],
+    "description": "Google Quick Share in Game Mode (headless rqs_lib daemon): receive and send files with Android phones and Windows PCs without leaving the game.",
+    "image": ""
+  }
+}
